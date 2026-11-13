@@ -503,7 +503,7 @@ tp4_start_memguard() {
           printf '[memguard] %s: %s GiB available, under the %s GiB floor for %s s; stopping the server\n' \
             "$who" "${sample[r]}" "$MEMGUARD_FLOOR_GIB" "$MEMGUARD_HOLD_S" | tee -a "$RUN_LOG_DIR/memguard.log" >&2
           MEMGUARD=0 "$REPO_ROOT/stop-tp4.sh" >> "$RUN_LOG_DIR/memguard.log" 2>&1 || true
-          exit 0
+          exit 3                  # it stopped the server (FOREGROUND=1 reads this)
         fi
       done
     done ) &

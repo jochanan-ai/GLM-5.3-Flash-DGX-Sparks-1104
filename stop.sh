@@ -6,8 +6,14 @@
 # one (two ~100 GiB workloads on a 128 GB host wedged spark4 on 2026-11-03).
 # Usage: ./stop.sh; DRY_RUN=1 ./stop.sh prints the plan and changes nothing.
 # Only this recipe's containers (label tf.recipe=glm53-spark) are stopped; any other container is left alone.
+# FABRIC_EXPECT=ring|mesh in the environment (as for ./start.sh): ./stop-tp4.sh, the four ranks' stop.
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
+case "${FABRIC_EXPECT:-}" in
+  '') ;;
+  ring|mesh) exec ./stop-tp4.sh "$@" ;;
+  *) printf '[E_CONFIG] FABRIC_EXPECT must be ring, mesh or unset, not %s.\n' "$FABRIC_EXPECT" >&2; exit 1 ;;
+esac
 # shellcheck source=scripts/prepare.sh
 source ./scripts/prepare.sh
 [[ "$STOP_TIMEOUT" =~ ^[1-9][0-9]*$ && "$LOG_KEEP" =~ ^[1-9][0-9]*$ ]] || fail E_CONFIG 'STOP_TIMEOUT and LOG_KEEP must be positive integers.'

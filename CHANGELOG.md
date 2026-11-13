@@ -1,5 +1,18 @@
 # Changelog
 
+- **2026-11-13** -- Running under a supervisor (systemd's `Type=simple`, llama-swap): `scripts/supervise.sh`, sourced by
+  `./start.sh` and `./start-tp4-switchless.sh`. `--allowed-host NAME` (repeatable) passes the names a proxy reaches the
+  API under to every rank's `serve` flags, for TensorFold's loopback `Host` check; any other argument is refused as
+  before. `PREPARE=0` makes a start check instead of build, download or copy (the image here and on each worker, the
+  checkpoint, DFlash2; `rsync` checked as `check`), stopping with `E_PREPARE` before any rank runs. `FOREGROUND=1`
+  keeps the start attached to rank 0 after the smoke test (start.lock let go), stops every rank on SIGINT/SIGTERM,
+  on a failure after the launch and when rank 0 ends, and exits 0 for a stop that was asked for, 1 for the memory
+  guard's stop (its subshell now exits 3 after stopping the server), else rank 0's code; a stop at work is waited
+  for up to `FOREGROUND_LOCK_WAIT_S` (120 s) and a Docker daemon that does not answer for a while ends nothing. `FABRIC_EXPECT=ring|mesh` in
+  the environment sends `./start.sh` to `./start-tp4-switchless.sh` and `./stop.sh` to `./stop-tp4.sh`. Without these
+  a start's plan and behaviour are unchanged (`DRY_RUN=1` output identical). `tests/test_supervise.py`: offline tests
+  with fake `docker` and `ssh`.
+
 - **2026-11-11** -- `MEMORY_RESERVE_GIB=6.5` and `CACHE_FIRST=1` are the defaults everywhere, the pair included (the
   reserve was 12, and the pair ran 9.5 in its `local.sh`; cache-first was off), with `PROMPT_CACHE_GIB` 5 on the pair
   (8 and 4 at four Sparks, as below). Cache-first is part of it: at 6.5 and windows first the pair's page pool would
