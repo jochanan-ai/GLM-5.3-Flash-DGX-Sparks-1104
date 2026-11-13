@@ -233,6 +233,20 @@ default 6.5.
 | `WAIT_TIMEOUT`, `SMOKE_TIMEOUT`, `STOP_TIMEOUT` | `2400`, `180`, `45` | Seconds |
 | `DRY_RUN` | `0` | `1` prints the plan and changes nothing |
 
+### Under a supervisor (systemd, llama-swap)
+
+`scripts/supervise.sh` adds what a supervisor that starts the server with one command and stops it with another needs.
+None of it changes a start that does not use it.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `--allowed-host NAME` (an argument, repeatable) | none | With `HOST=127.0.0.1` behind a proxy: TensorFold answers 403 to a request whose `Host` is not a loopback name (DNS rebinding guard), and a proxy passes its caller's `Host` on. Each name (a host name or an IP address, no port; at most 64) goes to every rank's `serve` flags as `--allowed-host`. `./start.sh [restart] [--allowed-host NAME]...` |
+| `PREPARE` | `auto` | `0`: a start builds, downloads and copies nothing. The image here, the same image on each worker, the checkpoint (its `.revision`) and DFlash2 are checked, and a start that misses one stops with `E_PREPARE` before any rank runs; `WORKER_WEIGHTS=rsync` is checked as `check`. `scripts/prepare.sh` does the work. `auto` and `1`: as before |
+| `FOREGROUND` | `0` | `1`: from the launch on, SIGINT and SIGTERM stop every rank (exit 130, 143), and a start that fails after the launch stops every rank. After the smoke test the start lets go of `start.lock` (so the supervisor's `./stop.sh` can run), follows rank 0's log and ends when rank 0's container stops, taking the other ranks down: exit 0 when a `./stop.sh` removed it (a stop that was asked for), 1 when the memory guard stopped the server, else rank 0's own code (1 for 0). A stop at work is waited for up to `FOREGROUND_LOCK_WAIT_S` (120 s, below a supervisor's stop timeout); a Docker daemon that does not answer for a while ends nothing. A server already running is attached to after its smoke test (which, failing, stops it) |
+| `FABRIC_EXPECT` (environment only) | unset | `ring` or `mesh`: `./start.sh` runs `./start-tp4-switchless.sh` and `./stop.sh` runs `./stop-tp4.sh`, so a supervisor that knows one pair of scripts serves four Sparks from the same commands |
+
+Offline tests: `python3 -m pytest tests/` (fake `docker` and `ssh`, no hardware).
+
 ## Hermes and other agents: the tool-call guard
 
 The server turns the `<tool_call>` markup GLM writes into OpenAI `tool_calls` only for tools the request offers, as

@@ -4,7 +4,9 @@
 # smoke-test it. The same image, patches, settings and checks as ./start.sh; the ring's NCCL settings and the workers'
 # NFS weights are scripts/tp4.sh. Four Sparks on a switch: ./start-tp4.sh, which runs this script with
 # FABRIC_EXPECT=mesh. README: "4 Sparks".
-# Usage: ./start-tp4-switchless.sh [restart]   (./stop-tp4.sh stops it; DRY_RUN=1 prints the plan and the ring found, changes nothing)
+# Usage: ./start-tp4-switchless.sh [restart] [--allowed-host NAME]...   (./stop-tp4.sh stops it; DRY_RUN=1 prints the plan and
+# the ring found, changes nothing). For a supervisor (scripts/supervise.sh): --allowed-host, PREPARE=0, FOREGROUND=1; it
+# can run ./start.sh and ./stop.sh with FABRIC_EXPECT=ring (or mesh) in the environment, which come here.
 # Configuration: scripts/config.sh defaults < .env < scripts/local.sh < exported environment, with WORKER, WORKER2 and
 # WORKER3 in the ring's order from this Spark (its two neighbours are WORKER and WORKER3; WORKER2 is across the ring).
 set -euo pipefail
@@ -25,12 +27,11 @@ source ./scripts/tp4.sh
 # shellcheck source=scripts/banner.sh
 source ./scripts/banner.sh
 case "${1:-}" in
-  '') MODE=start ;;
-  restart) MODE=restart ;;
-  help|-h|--help) sed -n '2,9s/^# //p' "$0"; exit 0 ;;
-  *) fail E_CONFIG "Usage: $TP4_START [restart]. Set serving options in the environment or scripts/local.sh." ;;
+  help|-h|--help) sed -n '2,11s/^# //p' "$0"; exit 0 ;;
 esac
-(( $# <= 1 )) || fail E_CONFIG "Usage: $TP4_START [restart]."
+# shellcheck source=scripts/supervise.sh
+source ./scripts/supervise.sh
+start_args "$TP4_START" "$@"
 validate_config
 # KV_SHARD=1 (engine patch 0114 here) shards each stream's latent rows over two ranks and refuses any other world
 # (KvShardNeedsTwoRanks): stop here, before anything runs, rather than after the four ranks start.
@@ -199,6 +200,7 @@ build_serve_args() {
   # LEARN_GIB: engine patch 0113 keeps the prompt states on disk too (rank 0's CACHE_DIR/learn holds every rank's part)
   [[ "$LEARN_GIB" == 0 ]] || SERVE_ARGS+=(--learn-conversations --learn-dir /state/learn --learn-gib "$LEARN_GIB"
     --learn-min-free-gib "$LEARN_MIN_FREE_GIB")
+  allowed_host_args
   read -r -a extra <<< "$SERVE_EXTRA_ARGS"
   SERVE_ARGS+=("${extra[@]}")
 }
@@ -436,6 +438,10 @@ PY
   live_message
 }
 
+# PREPARE=0's check of the workers' images and FOREGROUND=1's stop script
+tp4_image_ident_rank() { tp4_image_ident "$1" "$IMAGE"; }
+fg_init "$REPO_ROOT/stop-tp4.sh"
+
 banner
 printf '\n%s\n%s at once | context %s (%s)\n%s dense, %s head, %s KV | %s drafts | vision %s | reserve %s GiB | port %s\nTP=4 on %s: rank 0 here, ranks 1-3 on %s, %s, %s | NCCL only, prefill reduce %s\n' \
   "$MODEL_DESC" "$PARALLEL" "$CTX" "$CTX_NOTE" "$DENSE" "$HEAD" "$KV$([[ "$KV_PAGES" != on ]] || echo ' (one shared page pool; context = one request'"'"'s cap)')" \
@@ -463,14 +469,17 @@ else
   mkdir -p "$STATE_DIR"
   exec 8>"$STATE_DIR/start.lock"
   flock -n 8 || fail E_LOCK 'Another start, stop or preparation is in progress.'
+  fg_locked
   running=$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null || true)
   if [[ "$running" == true && "$MODE" == start ]]; then
     log "$CONTAINER_NAME is already running. Endpoint: $URL/v1"
     log "Use $TP4_START restart to apply changed settings, or ./stop-tp4.sh to stop it."
     RUN_LOG_DIR=$(readlink -f "$LOG_DIR/current" 2>/dev/null || true)
     [[ -d "$RUN_LOG_DIR" ]] || fail E_LOG 'The running container has no accessible log directory. Inspect its mounts.'
+    fg_launch
     wait_ready || { show_failure; fail E_START "A rank exited. Inspect $LOG_DIR/current/rank*.log; ./stop-tp4.sh archives them."; }
-    finish_start
+    fg_run finish_start
+    fg_attach --tail 50
     exit 0
   fi
   any=0
@@ -507,14 +516,21 @@ PY
   log "[I_PORT] Port $PORT and $NCCL_PORT-$((NCCL_PORT + 1)) are free."
 fi
 
-check_weights_access
+check_only || check_weights_access
 
-step 2 "Build the TensorFold native image with $PATCH_COUNT engine patches for sm_$SM, and send it to the three workers"
-prepare_image
-tp4_ship_image
+if check_only; then
+  step 2 'Check the TensorFold native image here and on the three workers (PREPARE=0)'
+  check_image
+  # shellcheck disable=SC2046
+  check_worker_images tp4_image_ident_rank whost $(worker_ids)
+else
+  step 2 "Build the TensorFold native image with $PATCH_COUNT engine patches for sm_$SM, and send it to the three workers"
+  prepare_image
+  tp4_ship_image
+fi
 
 step 3 'Download or check the checkpoint and the drafter weights'
-prepare_weights
+if check_only; then check_weights; else prepare_weights; fi
 model_overlay
 [[ "$EFFORT_AFTER_DOWNLOAD" == 0 ]] || effort_template
 
@@ -529,6 +545,7 @@ tp4_prepare_worker_weights
 
 step 5 "Start ranks 3, 2 and 1 on $(whost 3), $(whost 2) and $(whost 1), then rank 0 here"
 ATTEMPT=1
+fg_launch
 launch "$CTX"
 
 step 6 'Wait for the API and run a greedy smoke test'
@@ -563,8 +580,9 @@ if [[ "$DRY_RUN" != 1 ]] && ! wait_ready; then
     wait_ready && break
   done
 fi
+FG_SINCE=$(date +%s)                    # FOREGROUND=1 follows rank 0's log from here
 tp4_start_memguard
-finish_start
+fg_run finish_start
 if [[ "$DRY_RUN" != 1 ]]; then
   if [[ "$CONTEXT" == auto ]]; then
     remember_context "$FIT_KEY" "$CTX"
@@ -578,4 +596,9 @@ if [[ "$DRY_RUN" != 1 ]]; then
   elif (( ATTEMPT == 2 )); then
     log "Context: $CTX tokens, not the $CONTEXT asked; set CONTEXT=$CTX in scripts/local.sh to skip the refused start."
   fi
+fi
+if fg_on; then
+  fg_attach --since "$FG_SINCE"
+elif [[ "$FOREGROUND" == 1 ]]; then
+  log 'FOREGROUND=1: after the smoke test the start would stay attached to rank 0 until the server ends (DRY_RUN=1: not here).'
 fi

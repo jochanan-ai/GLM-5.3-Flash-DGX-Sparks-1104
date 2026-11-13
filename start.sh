@@ -1,22 +1,30 @@
 #!/usr/bin/env bash
 # One command: check both Sparks, build the engine image and send it to the worker, check the weights, start one rank
 # on each Spark, wait for the API and smoke-test it.
-# Usage: ./start.sh [restart]
+# Usage: ./start.sh [restart] [--allowed-host NAME]...
 # Configuration: scripts/config.sh defaults < .env < scripts/local.sh < exported environment.
 # DRY_RUN=1 ./start.sh prints the full plan, including the link it finds, and changes nothing.
+# For a supervisor (scripts/supervise.sh): --allowed-host, PREPARE=0, FOREGROUND=1; FABRIC_EXPECT=ring|mesh in the
+# environment runs the four-Spark start of this checkout instead (./start-tp4-switchless.sh).
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
+# FABRIC_EXPECT (ring or mesh, from the environment only, as a supervisor that knows one start script sets it): the
+# four-Spark start, which reads it the same way. Unset: the pair.
+case "${FABRIC_EXPECT:-}" in
+  '') ;;
+  ring|mesh) exec ./start-tp4-switchless.sh "$@" ;;
+  *) printf '[E_CONFIG] FABRIC_EXPECT must be ring, mesh or unset, not %s.\n' "$FABRIC_EXPECT" >&2; exit 1 ;;
+esac
 # shellcheck source=scripts/prepare.sh
 source ./scripts/prepare.sh
 # shellcheck source=scripts/banner.sh
 source ./scripts/banner.sh
 case "${1:-}" in
-  '') MODE=start ;;
-  restart) MODE=restart ;;
-  help|-h|--help) sed -n '2,7s/^# //p' "$0"; exit 0 ;;
-  *) fail E_CONFIG 'Usage: ./start.sh [restart]. Set serving options in the environment or scripts/local.sh.' ;;
+  help|-h|--help) sed -n '2,9s/^# //p' "$0"; exit 0 ;;
 esac
-(( $# <= 1 )) || fail E_CONFIG 'Usage: ./start.sh [restart].'
+# shellcheck source=scripts/supervise.sh
+source ./scripts/supervise.sh
+start_args ./start.sh "$@"
 validate_config
 set_image
 inspect_model
@@ -168,6 +176,7 @@ build_serve_args() {
   # LEARN_GIB: engine patch 0113 keeps the prompt states on disk too (rank 0's CACHE_DIR/learn holds every rank's part)
   [[ "$LEARN_GIB" == 0 ]] || SERVE_ARGS+=(--learn-conversations --learn-dir /state/learn --learn-gib "$LEARN_GIB"
     --learn-min-free-gib "$LEARN_MIN_FREE_GIB")
+  allowed_host_args
   read -r -a extra <<< "$SERVE_EXTRA_ARGS"
   SERVE_ARGS+=("${extra[@]}")
 }
@@ -310,7 +319,7 @@ start_memguard() {
         printf '%s [memguard] %s: %s GiB available, under the %s GiB floor for %s s; stopping the server\n' \
           "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$who" "$low" "$MEMGUARD_FLOOR_GIB" "$MEMGUARD_HOLD_S"
         MEMGUARD=0 "$REPO_ROOT/stop.sh" 2>&1 || true
-        exit 0
+        exit 3                    # it stopped the server (FOREGROUND=1 reads this)
       fi
     done ) </dev/null >> "$RUN_LOG_DIR/memguard.log" 2>&1 &
   MEMGUARD_PID=$!
@@ -554,6 +563,11 @@ PY
   live_message
 }
 
+# PREPARE=0's check of the worker's image (check_worker_images takes a rank) and FOREGROUND=1's stop script
+worker_image_ident_rank() { worker_image_ident "$IMAGE"; }
+worker_host_rank() { worker_host; }
+fg_init "$REPO_ROOT/stop.sh"
+
 banner
 printf '\n%s\n%s at once | context %s (%s)\n%s dense, %s head, %s KV | %s drafts | vision %s | reserve %s GiB | port %s\nrank 0 here, rank 1 on %s | RoCE %s\n' \
   "$MODEL_DESC" "$PARALLEL" "$CTX" "$CTX_NOTE" "$DENSE" "$HEAD" "$KV$([[ "$KV_PAGES" != on ]] || echo ' (one shared page pool; context = one request'"'"'s cap)')" \
@@ -571,6 +585,7 @@ else
   mkdir -p "$STATE_DIR"
   exec 8>"$STATE_DIR/start.lock"
   flock -n 8 || fail E_LOCK 'Another start, stop or preparation is in progress.'
+  fg_locked
   running=$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null || true)
   if [[ "$running" == true && "$MODE" == start ]]; then
     log "$CONTAINER_NAME is already running. Endpoint: $URL/v1"
@@ -578,9 +593,11 @@ else
     RUN_LOG_DIR=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/logs"}}{{.Source}}{{end}}{{end}}' "$CONTAINER_NAME")
     [[ -n "$RUN_LOG_DIR" && -d "$RUN_LOG_DIR" ]] || RUN_LOG_DIR=$(readlink -f "$LOG_DIR/current" 2>/dev/null || true)
     [[ -d "$RUN_LOG_DIR" ]] || fail E_LOG 'The running container has no accessible log directory. Inspect its mounts.'
+    fg_launch
     detect_link
     wait_ready || { show_failure; fail E_START "A rank exited. Inspect $LOG_DIR/current/rank*.log; ./stop.sh archives them."; }
-    finish_start
+    fg_run finish_start
+    fg_attach --tail 50
     exit 0
   fi
   # Settings are validated before an existing server is stopped; its logs are archived first.
@@ -602,14 +619,20 @@ PY
   log "[I_PORT] Port $PORT and $NCCL_PORT-$((NCCL_PORT + 1)) are free."
 fi
 
-check_weights_access
+check_only || check_weights_access
 
-step 2 "Build the TensorFold native image with $PATCH_COUNT engine patches for sm_$SM, and send it to $(worker_host)"
-prepare_image
-ship_image
+if check_only; then
+  step 2 "Check the TensorFold native image here and on $(worker_host) (PREPARE=0)"
+  check_image
+  check_worker_images worker_image_ident_rank worker_host_rank 1
+else
+  step 2 "Build the TensorFold native image with $PATCH_COUNT engine patches for sm_$SM, and send it to $(worker_host)"
+  prepare_image
+  ship_image
+fi
 
 step 3 'Download or check the checkpoint and the drafter weights on both Sparks'
-prepare_weights
+if check_only; then check_weights; else prepare_weights; fi
 model_overlay
 [[ "$EFFORT_AFTER_DOWNLOAD" == 0 ]] || effort_template
 
@@ -619,6 +642,7 @@ prepare_worker_weights
 
 step 5 "Start rank 1 on $(worker_host), then rank 0 here"
 ATTEMPT=1
+fg_launch
 launch "$CTX"
 
 step 6 'Wait for the API and run a greedy smoke test'
@@ -659,9 +683,10 @@ if [[ "$DRY_RUN" != 1 ]] && ! wait_ready; then
     wait_ready && break
   done
 fi
+FG_SINCE=$(date +%s)                    # FOREGROUND=1 follows rank 0's log from here
 [[ "$DRY_RUN" == 1 ]] || check_cache_min
 start_memguard
-finish_start
+fg_run finish_start
 if [[ "$DRY_RUN" != 1 ]]; then
   if [[ "$CONTEXT" == auto ]]; then
     remember_context "$FIT_KEY" "$CTX"
@@ -675,4 +700,9 @@ if [[ "$DRY_RUN" != 1 ]]; then
   elif (( ATTEMPT == 2 )); then
     log "Context: $CTX tokens, not the $CONTEXT asked; set CONTEXT=$CTX in scripts/local.sh to skip the refused start."
   fi
+fi
+if fg_on; then
+  fg_attach --since "$FG_SINCE"
+elif [[ "$FOREGROUND" == 1 ]]; then
+  log 'FOREGROUND=1: after the smoke test the start would stay attached to rank 0 until the server ends (DRY_RUN=1: not here).'
 fi

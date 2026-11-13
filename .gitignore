@@ -3,3 +3,5 @@
 /.env
 /scripts/local.sh
 /HANDOFF.md
+/tests/__pycache__/
+/.pytest_cache/
