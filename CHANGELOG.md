@@ -1,5 +1,29 @@
 # Changelog
 
+- **2026-11-21** -- `L2PF` defaults to `1` and is always passed to the ranks: on TensorFold 1.3.0 an unset
+  `TF_GLM_L2PF` means on for a GB10 (`cuda_l2pf.zig`), so every 1.3.0 start already prefetched and `L2PF=0` could not
+  turn it off (`TF_GLM_L2PF` is recipe-managed, so exporting it did not help either). Serving is unchanged at the
+  default; `L2PF=0` now passes `TF_GLM_L2PF=0`. `scripts/tests/l2pf-env.sh` checks both launchers. wojo's numbers in
+  issue #54 (+2.2-2.7% at one stream and +1.1% at four with `KV_SHARD=1`, measured on the earlier stack) are in the
+  README row.
+
+- **2026-11-21 (docs)** -- README, "The effort line": `/v1/models` reports `default_effort: "xhigh"` outside
+  `supported_efforts`, and `xhigh` requests still work (issue #50); thinking off is best-effort on very long prompts,
+  with thinking on as the fix for the 619,938-token case (issue #32), plus a troubleshooting row.
+
+- **2026-11-20 (fixes)** -- Engine patches `0014`-`0016`, found and verified on the 2x RTX PRO 6000 recipe with the same engine pin (`81de26f6`) and patch stack; not yet run on a GB10 pair, rebuild the image to pick them up:
+  - `0014` DFlash2 selector: a draft row with NaN or -inf logits returned the kernel's no-winner id `0x7fffffff`, which the host used to index the successor codebook and crashed the server. Ids outside the vocabulary are skipped now.
+  - `0015` `KV=fp8` on the page pool: the sparse token lists were written as BF16 page rows but read as positions by the E4M3 kernel, so prompts past `index_topk` (2,048 keys) attended the wrong rows (issue #64).
+  - `0016` `KV_SHARD=1` with DFlash2: the target MTP head's prompt rows were written through the key pages' table and stride instead of the latent pages' own, overwriting other layers' E4M3 scales, so decode after a prompt longer than about 768 tokens returned token 0. A sharded cache's latent rows are now written and read through the latent table everywhere.
+
+- **2026-11-20** -- Updated `TF_REF` from `f350cd3e` to `81de26f6` (TensorFold `1.3.0`) and ported the 13-patch stack (`0001`–`0013`, including `0013` for `KV_SHARD=1`):
+  - **Faster GLM decode launches:** Programmatic Dependent Launches (PDL) for GLM CUDA kernels and `qmmf` decode linears cut launch gaps between decode steps (`TF_GLM_PDL=0` to disable).
+  - **Upstreamed GLM CUDA & DFlash2 stack:** Paged E4M3 latent KV caches, grouped-experts load-ahead (`sm_120+`), fused MoE decode glue, `TF_GLM_ABSORB_MMA=1`, `TF_GLM_CE_EXCHANGE=1`, two-rank gather, DFlash2 window/copy-drafting rules, and shared sampling (`cuda.sample.rule`) are now built into upstream `1.3.0`.
+  - **Better prompt cache & KV pool behavior:** `--prompt-cache-gib` is reserved ahead of extra stream windows natively (`kv_pool.zig`), multi-turn thinking requests reuse reasoning in the next-turn cache guess (`#3264`), and KV page-retirement bookkeeping preserves reader fences and trim state (`#3852`).
+  - **TP=2 vision stability:** Rank 1 sleeps on its liveness line during long rank-0 vision passes (`#3675`).
+  - **`LEARN_GIB=0`:** Upstream `cuda_refusal.zig` excludes `--learn-conversations` for GLM on CUDA.
+  - **Verified live** on 2x DGX Spark (`spark3` + `spark4`, `tensorfold-glm53-spark:82b8d8de91de`, RoCE + `TF_GLM_L2PF`): `4,833` KV pages (`2,474,496` tokens across `PARALLEL=8`, `1,048,576` max context per request), `6.0 GiB` prompt cache, `39.5 tok/s` greedy (`3.0` tokens/round with DFlash2).
+
 - **2026-11-13** -- Running under a supervisor (systemd's `Type=simple`, llama-swap): `scripts/supervise.sh`, sourced by
   `./start.sh` and `./start-tp4-switchless.sh`. `--allowed-host NAME` (repeatable) passes the names a proxy reaches the
   API under to every rank's `serve` flags, for TensorFold's loopback `Host` check; any other argument is refused as

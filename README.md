@@ -208,7 +208,7 @@ default 6.5.
 | `MEMORY_RESERVE_GIB`, `HOST_CACHE_GIB`, `PROMPT_CACHE_GIB` | `6.5`, `0`, `5` | `PROMPT_CACHE_GIB` is `8` with EXL3 and `4` with `FP8=1` at four Sparks. See [Memory](#memory-on-a-128-gb-unified-spark); the reserve was 12 (the pair ran 9.5) before 2026-11-11 |
 | `LEARN_GIB`, `LEARN_MIN_FREE_GIB` | `0`, `15` | `LEARN_GIB` > 0 keeps the prompt states on disk too, up to that many GiB (`--learn-conversations`, patch 0113); see [Memory](#memory-on-a-128-gb-unified-spark) |
 | `KV_SHARD` | `0` | `1` keeps each stream's latent rows on one Spark (`TF_GLM_KV_SHARD`, patch 0114): about twice the tokens, 1-4% decode; use with `CACHE_FIRST=1 PROMPT_CACHE_GIB=6`, see [Memory](#memory-on-a-128-gb-unified-spark). Needs `KV=fp8`, `KV_PAGES=on`, DFlash2 or no drafter, `PARALLEL` auto or above 1. TP=2 only: `./start-tp4.sh` refuses it |
-| `L2PF` | `0` | `1` prefetches each decode window's next weights into L2 on a side stream (`TF_GLM_L2PF`, patch 0117, from upstream): the next layer's mixer input, this layer's router and KDA's `o_proj`, not the EXL3 routed experts. Upstream turns it on at TP>=2 on GB10; here it measured +2% at one stream and flat at four and eight (exact), so it stays opt-in. `TF_GLM_L2PF_MB`, `_CTAS`, `_PACE_GBPS` (12, 2, 150) pass through as exported `TF_*` variables |
+| `L2PF` | `1` | Prefetches each decode window's next weights into L2 on a side stream (`TF_GLM_L2PF`, built into TensorFold 1.3.0): the next layer's mixer input, this layer's router and KDA's `o_proj`, not the EXL3 routed experts. The engine turns it on by itself on GB10 when unset, so `0` is passed to turn it off. Measured +2% at one stream unsharded and +2.2-2.7% at one, +1.1% at four with `KV_SHARD=1` (issue #54), token hashes identical. `TF_GLM_L2PF_MB`, `_CTAS`, `_PACE_GBPS` (12, 2, 150) pass through as exported `TF_*` variables |
 | `CACHE_FIRST` | `1` | `1` sets `PROMPT_CACHE_GIB` (required) aside before the streams' windows (`TF_PROMPT_CACHE_FIRST`, patch 0112), so the cap becomes the cache; `0` counts whole windows first and gives the cache what they leave. See [Memory](#memory-on-a-128-gb-unified-spark) |
 | `PROMPT_CACHE_MIN_GIB` | empty | The smallest prompt cache a start may serve with. `start.sh` reads each rank's startup line and stops both ranks before LIVE (`E_CACHE`) when one funds less; the cache is what that start's room leaves, so `PROMPT_CACHE_GIB` caps it but does not guarantee it, even with `CACHE_FIRST=1` (issue 16). Empty: no check. `./start-tp4.sh` does not check it |
 | `WITH_VIDEO` | `0` | `1` builds `libtfvideo.so` (FFmpeg 9.0.2, static, LGPL; h264/hevc/vp8/vp9/mpeg4 in mp4/mkv) into its own image tag, so `VISION=1` serves `video_url` parts; a few minutes more at build |
@@ -325,6 +325,17 @@ template as it is; a `CHAT_TEMPLATE` of your own is always served as it is.
 Measured with sparkDash's quality suite (greedy, 755 items): with the line in every prompt, QA 79.3% against
 v0.6.0's 84.0% and MMLU 91.2%; with `EFFORT_LINE=thinking`, QA 86.0% (140 of 150 replies byte-identical to v0.6.0's)
 and MMLU 88.4%, thinking-on categories unchanged.
+
+`GET /v1/models` lists `supported_efforts` as the levels the template names in quotes (`max`, `high`, `low`), while
+`default_effort` is the configured `REASONING_EFFORT` as given, so the default `xhigh` is reported outside that list
+(issue #50). Requests with `reasoning_effort: "xhigh"` or no effort work: the engine passes `xhigh` through and the
+template renders it as the `Reasoning Effort: Max` line. A client that checks the default against the list should
+accept `xhigh`.
+
+Thinking off (the default here) is a best-effort mode on very long prompts: a 619,938-token retrieval over numeric
+filler returned repeated `</think>` and a prompt echo with thinking off on both checkpoints, with drafts on or off and
+`KV_SHARD` 0 or 1, and the right answer with thinking on (issue #32). For long-context work, send
+`enable_thinking: true` or start with `THINKING=1`.
 
 ## Engine patches
 
@@ -504,7 +515,7 @@ Settings at four Sparks:
 | `FP8` | `1` serves Z.AI's block FP8 release (patch 0107); four Sparks only |
 | `LEARN_GIB` | Conversations on disk (patch 0113): rank 0's `CACHE_DIR/learn` holds every rank's part |
 | `MEMORY_RESERVE_GIB`, `CACHE_FIRST`, `PROMPT_CACHE_GIB` | Four Sparks: `6.5`, `1`, and `4` with `FP8=1` or `8` with EXL3 (the pair: `6.5`, `1`, `5`). `FP8=1`, measured 2026-11-11: 6,147 pages (3.15M tokens) and a 3.9 GiB prompt cache a rank, with 7.6-10.5 GiB still available on each Spark; at 9.5 the same start had no prompt cache (the pages left 0.08 GiB), at 8, 2.4 GiB. EXL3 at 6.5: the same 16,392 pages it held at 12 (all eight 1M windows) and an 8.0 GiB prompt cache instead of 3.6. See the memory table under [Weights](#4-sparks-tp4-experimental). A value set in `local.sh` or the environment wins |
-| `L2PF` | `1` prefetches the next weights into L2 during decode (patch 0117); unmeasured at four, opt-in |
+| `L2PF` | `1` (default) prefetches the next weights into L2 during decode, `0` turns it off; unmeasured at four |
 | `EXTRA_EOS` | `<\|assistant\|>` by default (patch 0120), as on the pair |
 | `THINK_OFF_SPLIT` | Opt-in (patch 0121), as on the pair |
 | `EFFORT_LINE`, `CHAT_TEMPLATE` | As on the pair; the written template goes to every worker |
@@ -608,6 +619,7 @@ only ever stops containers labelled `tf.recipe=glm53-spark`.
 | A reply ends with `<\|assistant\|>` followed by the same answer again, `finish_reason: length` | The checkpoint's EOS list leaves out `<\|assistant\|>`. Keep `EXTRA_EOS` at its default (`<\|assistant\|>`) |
 | With thinking off, `content` starts with a draft ("We need ...") and holds `</think>` | The model reasoned anyway. Set `THINK_OFF_SPLIT=1024` (off by default) so the draft goes to `reasoning_content`; raise it if the draft is longer |
 | A thinking-off reply works the sum out in its answer and `finish_reason` is `length` on a short `max_tokens` | The prompt carries the template's `Reasoning Effort: Max` line (`EFFORT_LINE=always`, or a `CHAT_TEMPLATE` of your own); `EFFORT_LINE=thinking` (default) writes it with thinking on only. `/tokenize` on a one-line user message shows it: 7 tokens more |
+| A thinking-off reply to a prompt of several hundred thousand tokens repeats `</think>` and echoes the prompt | Thinking off is best-effort on very long prompts; send that request with thinking on (see [The effort line](#the-effort-line), issue #32) |
 | `[E_FABRIC]` | No directly reached address, or no RoCE v2 GID holding an IPv4 on the link's port: cable the Sparks on one subnet, or set `FABRIC_PEER` / `NCCL_IB_GID_INDEX` |
 | `[W_FABRIC]` a rail left out | The second rail does not carry a full-size ping; check the cable, the twin's address and MTU |
 | `[E_MEMORY]`, `[E_PORT]` | Less than `MIN_AVAIL_GIB` available (another rank, usually), or a port in use |

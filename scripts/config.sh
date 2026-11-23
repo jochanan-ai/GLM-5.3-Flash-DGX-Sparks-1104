@@ -29,7 +29,7 @@ unset _cfg_key _cfg_line _cfg_value
 
 # --- pinned engine build (hashed into the image tag with docker/ and patches/engine/*.patch) ----------------------
 TF_REPO="${TF_REPO:-https://github.com/ashhart/TensorFold.git}"
-TF_REF="${TF_REF:-f350cd3ea253a042e205746928271f9d8f71a82d}"
+TF_REF="${TF_REF:-81de26f649677aa72ae0034d4af6e010cd947038}"
 ZIG_VERSION="${ZIG_VERSION:-0.17.0}"
 # sha256 of zig-aarch64-linux-0.17.0.tar.xz (ziglang.org/download/index.json).
 ZIG_SHA256="${ZIG_SHA256:-9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8}"
@@ -242,12 +242,12 @@ LEARN_MIN_FREE_GIB="${LEARN_MIN_FREE_GIB:-15}"
 # (1-4% decode). Needs KV=fp8, KV pages, DFlash2 or no drafter, PARALLEL above 1. The pool then takes most of the
 # room: pair it with CACHE_FIRST=1 PROMPT_CACHE_GIB so long conversations stay kept. 0 (default): off, as before.
 KV_SHARD="${KV_SHARD:-0}"
-# L2PF=1 (engine patch 0117, TF_GLM_L2PF, ported from upstream): each decode window reads the next layer's mixer
-# weights, this layer's router and KDA's o_proj into L2 on a side stream while the gathers and chains run (not the
-# EXL3 routed experts). Upstream turns it on by default on GB10 at TP>=2; on this pair (2026-11-11) it gave +2% at one
-# stream and nothing measurable at four or eight, token hashes identical. Both ranks must agree (the fingerprint
-# carries it). 0 (default): off, as before.
-L2PF="${L2PF:-0}"
+# L2PF (TF_GLM_L2PF, built into TensorFold 1.3.0): each decode window reads the next layer's mixer weights, this
+# layer's router and KDA's o_proj into L2 on a side stream while the gathers and chains run (not the EXL3 routed
+# experts). The engine turns it on by itself on a GB10 when the variable is unset, so the launchers always pass it.
+# On the pair it gave +2% at one stream unsharded (2026-11-11) and +2.2-2.7% at one, +1.1% at four with KV_SHARD=1
+# (issue #54), token hashes identical. Both ranks must agree (the fingerprint carries it). 1 (default): on; 0: off.
+L2PF="${L2PF:-1}"
 VISION="${VISION:-1}"                            # --vision: images (rank 0's tower)
 VISION_MAX_IMAGES="${VISION_MAX_IMAGES:-50}"     # --vision-max-images: images per request (engine default 4, at most 64)
 # --chat-template: auto = with VISION=1, templates/glm-5.3-flash-vision.jinja (the checkpoint's own template, whose media
